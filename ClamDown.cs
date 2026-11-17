@@ -31,12 +31,17 @@ namespace HbAi.ClamDown
         public static readonly Guid StandbyIdle = new Guid("29f6c1db-86da-48c5-9fdb-f2b67b1f44da");
         public static readonly Guid HibernateIdle = new Guid("9d7815a6-7ee4-497e-8888-515a05f02364");
         public static readonly Guid UnattendedSleep = new Guid("7bc4a2f9-d8fc-4469-b07b-33eb785aaca0");
+        public static readonly Guid SubVideo = new Guid("7516b95f-f776-4464-8c53-06167f40cc99");
+        public static readonly Guid VideoIdle = new Guid("3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e");       // гасить экран через
+        public static readonly Guid VideoConLock = new Guid("8ec4b3a5-6868-48c2-be75-4f3044be88a7");    // гасить экран блокировки через
 
-        // что меняем: (подгруппа, параметр, значение на время работы)
+        // что меняем: (подгруппа, параметр, значение на время работы). Экран тоже: на ноутбуках с Modern Standby
+        // погасший экран (в том числе экран блокировки через ~30–60 с) уводит систему в режим ожидания — проверено 17.11.2026.
         public static readonly Guid[][] Items = new Guid[][] {
             new Guid[] { SubButtons, LidAction }, new Guid[] { SubSleep, StandbyIdle },
-            new Guid[] { SubSleep, HibernateIdle }, new Guid[] { SubSleep, UnattendedSleep } };
-        public static readonly uint[] AwakeValues = new uint[] { 0, 0, 0, 0 }; // крышка: ничего не делать; тайм-ауты: никогда
+            new Guid[] { SubSleep, HibernateIdle }, new Guid[] { SubSleep, UnattendedSleep },
+            new Guid[] { SubVideo, VideoIdle }, new Guid[] { SubVideo, VideoConLock } };
+        public static readonly uint[] AwakeValues = new uint[] { 0, 0, 0, 0, 0, 0 }; // крышка: ничего не делать; тайм-ауты: никогда
 
         [DllImport("powrprof.dll")] static extern uint PowerGetActiveScheme(IntPtr root, out IntPtr scheme);
         [DllImport("powrprof.dll")] static extern uint PowerSetActiveScheme(IntPtr root, ref Guid scheme);
@@ -120,11 +125,13 @@ namespace HbAi.ClamDown
             scheme = Guid.Empty; v = null;
             if (string.IsNullOrEmpty(s)) return false;
             string[] parts = s.Trim().Split(';');
-            if (parts.Length != Items.Length + 1) return false;
+            // версия 1.0 сохраняла 4 параметра; недостающие — «не трогать»
+            if (parts.Length < 5 || parts.Length > Items.Length + 1) return false;
             try { scheme = new Guid(parts[0]); } catch { return false; }
             v = new uint?[Items.Length][];
             for (int i = 0; i < Items.Length; i++)
             {
+                if (i + 1 >= parts.Length) { v[i] = new uint?[2]; continue; }
                 string[] ab = parts[i + 1].Split(',');
                 if (ab.Length != 2) return false;
                 v[i] = new uint?[2];
@@ -416,7 +423,7 @@ namespace HbAi.ClamDown
         public const string Version = "1.0";
 
         [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
-        const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x1;
+        const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x1, ES_DISPLAY_REQUIRED = 0x2;
         [DllImport("user32.dll")] static extern IntPtr RegisterPowerSettingNotification(IntPtr h, ref Guid g, int flags);
         [DllImport("user32.dll")] static extern bool LockWorkStation();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
@@ -526,7 +533,7 @@ namespace HbAi.ClamDown
                 uint?[][] saved = Power.Read(scheme);
                 Store.Write(Store.Saved, Power.Serialize(scheme, saved));
                 Power.Write(scheme, Power.AwakeFor(saved), true);
-                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED); // экран «логически включён»: иначе Modern Standby
                 on = true; byAgent = auto; onScheme = scheme;
                 untilUtc = !auto && prefs.Hours > 0 ? (DateTime?)DateTime.UtcNow.AddHours(prefs.Hours) : null;
                 agentQuietSince = null;
@@ -804,12 +811,13 @@ namespace HbAi.ClamDown
                 Directory.Delete(tmp, true);
 
                 // 4. Формат файла сохранённых настроек
-                uint?[][] sample = new uint?[][] { new uint?[] { 1, 1 }, new uint?[] { 900, null }, new uint?[] { 0, 10800 }, new uint?[] { 120, 120 } };
+                uint?[][] sample = new uint?[][] { new uint?[] { 1, 1 }, new uint?[] { 900, null }, new uint?[] { 0, 10800 }, new uint?[] { 120, 120 }, new uint?[] { 600, 300 }, new uint?[] { 60, 60 } };
                 Guid sg = Guid.NewGuid();
                 string ser = Power.Serialize(sg, sample);
                 Guid pg; uint?[][] pv;
                 Ok(Power.TryParse(ser, out pg, out pv) && pg == sg && Same(pv, sample), "запись и чтение файла настроек");
                 Ok(!Power.TryParse("мусор", out pg, out pv), "битый файл не принимается");
+                Ok(Power.TryParse(sg + ";1,1;0,1800;900,900;120,120", out pg, out pv) && pv[0][0] == 1 && pv[1][1] == 1800 && !pv[4][0].HasValue, "файл версии 1.0 (4 параметра) читается");
 
                 // 5. Настоящие настройки питания — на временной КОПИИ схемы (активная схема не меняется)
                 Guid active = Power.ActiveScheme();
@@ -826,6 +834,8 @@ namespace HbAi.ClamDown
                     uint?[][] awake = Power.Read(copy);
                     Ok(awake[0][0] == 0 && awake[0][1] == 0, "крышка: «ничего не делать» записано");
                     Ok(awake[1][0] == 0 && awake[1][1] == 0, "сон: «никогда» записано");
+                    Ok((!orig[5][0].HasValue || awake[5][0] == 0) && (!orig[4][0].HasValue || awake[4][0] == 0), "экран и экран блокировки: «никогда» записано");
+                    log.AppendLine("INFO экран: " + orig[4][0] + "/" + orig[4][1] + " с, экран блокировки: " + orig[5][0] + "/" + orig[5][1] + " с");
                     Ok(Watchdog.RestoreFromFile(savedPath, false) && !File.Exists(savedPath), "возврат из файла");
                     Ok(Same(Power.Read(copy), orig), "после возврата настройки как были");
                 }
