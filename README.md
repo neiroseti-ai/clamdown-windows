@@ -26,7 +26,7 @@
 Поэтому **не кладите работающий ноутбук с закрытой крышкой в закрытую сумку**: вентиляторам нужен воздух.
 
 ## Установка и удаление
-1. Скачайте `ClamDownWin.exe` и положите в постоянную папку, например `%LOCALAPPDATA%\Programs\ClamDown`.
+1. Скачайте [ClamDownWin.exe](https://github.com/neiroseti-ai/clamdown-windows/releases/latest/download/ClamDownWin.exe) и положите в постоянную папку, например `%LOCALAPPDATA%\Programs\ClamDown`. Программа не подписана: при первом запуске Windows покажет «Windows защитила ваш компьютер» — нажмите «Подробнее» → «Выполнить в любом случае».
 2. Запустите. Значок появится в трее. В меню можно включить «Запускать вместе с Windows».
 
 Удаление: выйти из программы через меню, затем выполнить `ClamDownWin.exe --uninstall` (вернёт настройки сна, уберёт задачу-страховку и автозапуск) и удалить файл и папку `%LOCALAPPDATA%\ClamDownWin`.
@@ -38,7 +38,7 @@
 ```
 %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /optimize+ /out:ClamDownWin.exe /r:System.Management.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll ClamDown.cs
 ```
-Самопроверка (на временной копии схемы питания, ваша не меняется): `ClamDownWin.exe --selftest result.txt`.
+Самопроверка (56 пунктов, на временной копии схемы питания, ваша не меняется): `ClamDownWin.exe --selftest result.txt`. Мутационная проверка самопроверки: `python mutate.py` (программу перед этим закрыть).
 
 ---
 
