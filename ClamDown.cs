@@ -246,13 +246,13 @@ namespace HbAi.ClamDown
                 // программа закрылась: если штатно — сохранённых настроек нет; если её убили — ждём тишины пульса и возвращаем
                 for (int i = 0; i < 24; i++)
                 {
-                    if (!File.Exists(Store.Saved)) return 0;
                     bool appRunning;
                     try { using (Mutex.OpenExisting(App.MutexName)) { } appRunning = true; }
                     catch (WaitHandleCannotBeOpenedException) { appRunning = false; }
                     catch (UnauthorizedAccessException) { appRunning = true; }
-                    if (appRunning) return 0; // программу запустили снова — дальше она сама
-                    if (ShouldRestore(true, ReadPulse(Store.Pulse), DateTime.UtcNow, false))
+                    GuardStep step = GuardDecide(File.Exists(Store.Saved), appRunning, ReadPulse(Store.Pulse), DateTime.UtcNow);
+                    if (step == GuardStep.Done) return 0;
+                    if (step == GuardStep.Restore)
                     {
                         try { if (RestoreFromFile(Store.Saved, true)) Store.Note("Сторож: программа закрылась аварийно, настройки питания возвращены."); }
                         catch (Exception e) { Store.Note("Сторож: ошибка возврата: " + e.Message); }
@@ -262,6 +262,13 @@ namespace HbAi.ClamDown
                 }
             }
             return 0;
+        }
+        public enum GuardStep { Done, Restore, Wait }
+        /// <summary>Шаг сторожа: настроек нет или программа снова запущена — конец; пульс молчит 90 с — вернуть; иначе ждать.</summary>
+        public static GuardStep GuardDecide(bool savedExists, bool appRunning, DateTime? pulse, DateTime nowUtc)
+        {
+            if (!savedExists || appRunning) return GuardStep.Done;
+            return ShouldRestore(true, pulse, nowUtc, false) ? GuardStep.Restore : GuardStep.Wait;
         }
         public static void StartGuard(string exe)
         {
@@ -398,6 +405,35 @@ namespace HbAi.ClamDown
         }
     }
 
+    // ---------------- решения программы в трее (вынесены, чтобы их проверяла самопроверка) ----------------
+    public static class Policy
+    {
+        public static readonly TimeSpan AgentGrace = TimeSpan.FromMinutes(5);  // агент затих — выключаемся через столько
+        public const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x1, ES_DISPLAY_REQUIRED = 0x2;
+        /// <summary>Флаги на время работы: экран «логически включён», иначе Modern Standby (проверено 17.11.2026).</summary>
+        public const uint AwakeFlags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED;
+        /// <summary>Включиться самой из-за агента: агент работает, режим выключен, авто не придержано, нет причины выключиться.</summary>
+        public static bool AutoStart(bool working, bool on, bool held, string stopReason) { return working && !on && !held && stopReason == null; }
+        /// <summary>Придержать авто после выключения (вручную, по заряду, по таймеру), пока агент не затихнет.</summary>
+        public static bool HoldAfterStop(bool byAgent, bool autoEnabled) { return byAgent || autoEnabled; }
+        /// <summary>Агент затих достаточно давно — выключаться.</summary>
+        public static bool AgentDone(DateTime? quietSince, DateTime nowUtc) { return quietSince.HasValue && nowUtc - quietSince.Value >= AgentGrace; }
+        /// <summary>Байт из сообщения Windows о крышке: 0 — закрыта.</summary>
+        public static bool LidClosed(byte data) { return data == 0; }
+        /// <summary>Усыплять ли после выключения: только по заряду, таймеру, перегреву и концу работы агента, и только с закрытой крышкой.</summary>
+        public static bool SleepAfter(StopKind kind, bool lidClosed) { return lidClosed && kind == StopKind.Limit; }
+
+        /// <summary>Начать: если остался хвост прошлого раза — сначала вернуть его; потом запомнить и записать «не спать».</summary>
+        public static void Begin(Guid scheme, bool apply)
+        {
+            if (File.Exists(Store.Saved)) Watchdog.RestoreFromFile(Store.Saved, apply);
+            uint?[][] saved = Power.Read(scheme);
+            Store.Write(Store.Saved, Power.Serialize(scheme, saved));
+            Power.Write(scheme, Power.AwakeFor(saved), apply);
+        }
+    }
+    public enum StopKind { Manual, Limit, System }
+
     // ---------------- температура, если Windows её отдаёт ----------------
     public static class Thermal
     {
@@ -468,7 +504,7 @@ namespace HbAi.ClamDown
         public const string Version = "1.0";
 
         [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
-        const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x1, ES_DISPLAY_REQUIRED = 0x2;
+        const uint ES_CONTINUOUS = Policy.ES_CONTINUOUS;
         [DllImport("user32.dll")] static extern IntPtr RegisterPowerSettingNotification(IntPtr h, ref Guid g, int flags);
         [DllImport("user32.dll")] static extern bool LockWorkStation();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
@@ -550,11 +586,11 @@ namespace HbAi.ClamDown
             if (m.Msg == WM_POWERBROADCAST && m.WParam.ToInt32() == PBT_POWERSETTINGCHANGE)
             {
                 PowerBroadcastSetting ps = (PowerBroadcastSetting)Marshal.PtrToStructure(m.LParam, typeof(PowerBroadcastSetting));
-                if (ps.PowerSetting == LidSwitch) OnLid(ps.Data == 0);
+                if (ps.PowerSetting == LidSwitch) OnLid(Policy.LidClosed(ps.Data));
             }
             if (m.Msg == WM_POWERBROADCAST && m.WParam.ToInt32() == PBT_APMRESUMEAUTOMATIC) Pulse();
             if (m.Msg == WM_QUERYENDSESSION || (m.Msg == WM_ENDSESSION && m.WParam != IntPtr.Zero))
-                Stop("выключение или перезагрузка Windows", false, false);
+                Stop("выключение или перезагрузка Windows", false, StopKind.System);
             base.WndProc(ref m);
         }
 
@@ -573,13 +609,9 @@ namespace HbAi.ClamDown
             if (on) return;
             try
             {
-                // хвост от прошлого раза: сначала вернуть, иначе перезапишем исходные настройки уже изменёнными
-                if (File.Exists(Store.Saved)) Watchdog.RestoreFromFile(Store.Saved, true);
                 Guid scheme = Power.ActiveScheme();
-                uint?[][] saved = Power.Read(scheme);
-                Store.Write(Store.Saved, Power.Serialize(scheme, saved));
-                Power.Write(scheme, Power.AwakeFor(saved), true);
-                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED); // экран «логически включён»: иначе Modern Standby
+                Policy.Begin(scheme, true);
+                SetThreadExecutionState(Policy.AwakeFlags);
                 on = true; byAgent = auto; onScheme = scheme;
                 untilUtc = !auto && prefs.Hours > 0 ? (DateTime?)DateTime.UtcNow.AddHours(prefs.Hours) : null;
                 agentQuietSince = null;
@@ -595,18 +627,18 @@ namespace HbAi.ClamDown
             Refresh2();
         }
 
-        /// <summary>sleep: усыпить ноутбук, если крышка закрыта (заряд, таймер, перегрев, конец работы агента).</summary>
-        void Stop(string reason, bool notify, bool sleep)
+        /// <summary>kind = Limit: усыпить ноутбук, если крышка закрыта (заряд, таймер, перегрев, конец работы агента).</summary>
+        void Stop(string reason, bool notify, StopKind kind)
         {
             if (!on) return;
-            if (byAgent || prefs.Auto) autoHeld = true; // пока агент работает, само не включаться
+            if (Policy.HoldAfterStop(byAgent, prefs.Auto)) autoHeld = true; // пока агент работает, само не включаться
             on = false; byAgent = false; untilUtc = null;
             SetThreadExecutionState(ES_CONTINUOUS);
             try { Watchdog.RestoreFromFile(Store.Saved, true); } catch (Exception e) { Store.Note("Возврат настроек: " + e.Message); }
             Store.Note("Выключено: " + reason + ".");
             Refresh2();
             if (notify) tray.ShowBalloonTip(8000, "ClamDown выключен", "Причина: " + reason + ". Настройки сна вернулись.", ToolTipIcon.Info);
-            if (sleep && lidClosed) sleepLater.Start();
+            if (Policy.SleepAfter(kind, lidClosed)) sleepLater.Start();
         }
 
         void GoToSleep()
@@ -617,7 +649,7 @@ namespace HbAi.ClamDown
                 SendMessage((IntPtr)0xFFFF, WM_SYSCOMMAND, (IntPtr)SC_MONITORPOWER, (IntPtr)2);
         }
 
-        void Toggle() { if (on) Stop("вручную", false, false); else { autoHeld = false; Start(false); } }
+        void Toggle() { if (on) Stop("вручную", false, StopKind.Manual); else { autoHeld = false; Start(false); } }
 
         // ---- каждые 15 секунд ----
         void Tick()
@@ -626,7 +658,7 @@ namespace HbAi.ClamDown
             DateTime now = DateTime.UtcNow;
             // состояние разошлось: страховка уже вернула настройки (например, после сна) или сменили схему питания
             if (on && !File.Exists(Store.Saved)) { on = false; byAgent = false; SetThreadExecutionState(ES_CONTINUOUS); Store.Note("Настройки вернула страховка, режим снят."); }
-            if (on) { try { if (Power.ActiveScheme() != onScheme) Stop("сменили схему питания", true, false); } catch { } }
+            if (on) { try { if (Power.ActiveScheme() != onScheme) Stop("сменили схему питания", true, StopKind.Manual); } catch { } }
 
             PowerStatus ps = SystemInformation.PowerStatus;
             bool battery = ps.PowerLineStatus == PowerLineStatus.Offline;
@@ -638,17 +670,17 @@ namespace HbAi.ClamDown
             {
                 bool working = Agents.Working(Agents.Home, now);
                 if (!working) autoHeld = false;
-                if (working) { agentQuietSince = null; if (!on && !autoHeld && batteryWhy == null) Start(true); }
+                if (working) { agentQuietSince = null; if (Policy.AutoStart(working, on, autoHeld, batteryWhy)) Start(true); }
                 else if (on && byAgent)
                 {
                     if (!agentQuietSince.HasValue) agentQuietSince = now;
-                    else if (now - agentQuietSince.Value >= TimeSpan.FromMinutes(5)) Stop("агент закончил работу", true, true);
+                    else if (Policy.AgentDone(agentQuietSince, now)) Stop("агент закончил работу", true, StopKind.Limit);
                 }
             }
             if (on)
             {
                 string why = Rules.StopReason(battery, pct, prefs.Floor, untilUtc, now, temp, prefs.TempMax);
-                if (why != null) Stop(why, true, true);
+                if (why != null) Stop(why, true, StopKind.Limit);
             }
             Refresh2();
         }
@@ -751,12 +783,12 @@ namespace HbAi.ClamDown
 
         void Quit()
         {
-            Stop("вручную", false, false);
+            Stop("вручную", false, StopKind.Manual);
             try { File.Delete(Store.Pulse); } catch { }
             tray.Visible = false;
             Application.Exit();
         }
-        protected override void OnFormClosing(FormClosingEventArgs e) { if (on) Stop("программа закрыта", false, false); tray.Visible = false; base.OnFormClosing(e); }
+        protected override void OnFormClosing(FormClosingEventArgs e) { if (on) Stop("программа закрыта", false, StopKind.System); tray.Visible = false; base.OnFormClosing(e); }
 
         // ---- значок: раскрытая раковина-ноутбук; зелёная точка — режим включён ----
         static Icon MakeIcon(bool active)
@@ -787,6 +819,20 @@ namespace HbAi.ClamDown
             if (args.Length > 1 && args[0] == "--guard" && int.TryParse(args[1], out gp)) return Watchdog.Guard(gp);
             if (args.Length > 1 && args[0] == "--selftest") return SelfTest.Run(args[1]);
             if (args.Length > 1 && args[0] == "--shot") return Shot(args[1]);
+            // служебное: снимок текущих настроек питания в файл и запись снимка обратно (для мутационной проверки)
+            if (args.Length > 1 && args[0] == "--dump")
+            {
+                Guid g = Power.ActiveScheme();
+                File.WriteAllText(args[1], Power.Serialize(g, Power.Read(g)), Encoding.ASCII);
+                return 0;
+            }
+            if (args.Length > 1 && args[0] == "--apply")
+            {
+                Guid g; uint?[][] v;
+                if (!Power.TryParse(File.ReadAllText(args[1]), out g, out v)) return 2;
+                Power.Write(g, v, true);
+                return 0;
+            }
             if (args.Length > 0 && args[0] == "--uninstall")
             {
                 try { Watchdog.RestoreFromFile(Store.Saved, true); } catch { }
@@ -826,6 +872,22 @@ namespace HbAi.ClamDown
                 Ok(Rules.StopReason(false, 80, 15, null, n, 91.2, 90) == "перегрев: 91 °C", "перегрев");
                 Ok(Rules.StopReason(false, 80, 15, null, n, null, 90) == null, "температуры нет — не выключать");
                 Ok(Rules.Left(TimeSpan.FromMinutes(102)) == "1 ч 42 мин", "остаток времени");
+                Ok(Rules.Left(TimeSpan.FromMinutes(-5)) == "0 ч 00 мин", "остаток после срока — ноль");
+                Ok(Rules.StopReason(false, 80, 15, null, n, 90.0, 90) == "перегрев: 90 °C", "перегрев ровно на пороге");
+
+                // 1б. Решения программы в трее
+                Ok(Policy.AutoStart(true, false, false, null), "агент работает — включиться");
+                Ok(!Policy.AutoStart(true, false, false, "заряд упал до 10%"), "агент работает, но заряд низкий — не включаться");
+                Ok(!Policy.AutoStart(true, false, true, null), "выключили вручную — само не включаться");
+                Ok(!Policy.AutoStart(false, false, false, null), "агент не работает — не включаться");
+                Ok(!Policy.AutoStart(true, true, false, null), "уже включено — не включать заново");
+                Ok(Policy.HoldAfterStop(true, false) && Policy.HoldAfterStop(false, true) && !Policy.HoldAfterStop(false, false), "придержать авто после выключения");
+                Ok(!Policy.AgentDone(n.AddMinutes(-4), n) && Policy.AgentDone(n.AddMinutes(-5), n) && !Policy.AgentDone(null, n), "агент затих 5 мин — выключаться");
+                Ok(Policy.LidClosed(0) && !Policy.LidClosed(1), "крышка: 0 — закрыта");
+                Ok((Policy.AwakeFlags & Policy.ES_DISPLAY_REQUIRED) != 0 && (Policy.AwakeFlags & Policy.ES_SYSTEM_REQUIRED) != 0 && (Policy.AwakeFlags & Policy.ES_CONTINUOUS) != 0, "флаги: система и экран не спят");
+                Ok(Policy.SleepAfter(StopKind.Limit, true), "по заряду или таймеру с закрытой крышкой — усыпить");
+                Ok(!Policy.SleepAfter(StopKind.Limit, false), "крышка открыта — не усыплять");
+                Ok(!Policy.SleepAfter(StopKind.System, true) && !Policy.SleepAfter(StopKind.Manual, true), "выключение Windows или вручную — не усыплять");
 
                 // 2. Страховка
                 Ok(!Watchdog.ShouldRestore(false, null, n, false), "нет сохранённых — ничего не делать");
@@ -833,6 +895,11 @@ namespace HbAi.ClamDown
                 Ok(Watchdog.ShouldRestore(true, n.AddSeconds(-91), n, false), "пульс старше 90 с — вернуть");
                 Ok(!Watchdog.ShouldRestore(true, n.AddSeconds(-30), n, true), "программа жива — не трогать");
                 Ok(Watchdog.ShouldRestore(true, n.AddSeconds(-200), n, true), "программа зависла (пульс старый) — вернуть");
+                Ok(Watchdog.ShouldRestore(true, n.AddSeconds(-90), n, true), "пульс ровно 90 с — вернуть");
+                Ok(Watchdog.GuardDecide(false, false, null, n) == Watchdog.GuardStep.Done, "сторож: настроек нет — конец");
+                Ok(Watchdog.GuardDecide(true, true, n.AddSeconds(-200), n) == Watchdog.GuardStep.Done, "сторож: программу запустили снова — конец");
+                Ok(Watchdog.GuardDecide(true, false, n.AddSeconds(-30), n) == Watchdog.GuardStep.Wait, "сторож: пульс свежий — ждать");
+                Ok(Watchdog.GuardDecide(true, false, n.AddSeconds(-95), n) == Watchdog.GuardStep.Restore, "сторож: тишина 95 с — вернуть");
 
                 // 3. Агенты
                 string tmp = Path.Combine(Path.GetTempPath(), "clamdown_selftest_" + Guid.NewGuid().ToString("N"));
@@ -865,6 +932,13 @@ namespace HbAi.ClamDown
                 Guid pg; uint?[][] pv;
                 Ok(Power.TryParse(ser, out pg, out pv) && pg == sg && Same(pv, sample), "запись и чтение файла настроек");
                 Ok(!Power.TryParse("мусор", out pg, out pv), "битый файл не принимается");
+                Ok(!Power.TryParse(sg + ";1,1", out pg, out pv), "обрезанный файл не принимается");
+                uint?[][] half = new uint?[][] { new uint?[] { 1, null }, new uint?[] { null, 1800 }, new uint?[] { 5, 5 }, new uint?[] { 5, 5 }, new uint?[] { 5, 5 }, new uint?[] { 5, 5 } };
+                uint?[][] aw = Power.AwakeFor(half);
+                Ok(aw[0][0] == 0 && !aw[0][1].HasValue && !aw[1][0].HasValue && aw[1][1] == 0, "«не спать» только там, где параметр есть");
+                HashSet<string> pairs = new HashSet<string>();
+                foreach (Guid[] it in Power.Items) pairs.Add(it[0] + "/" + it[1]);
+                Ok(pairs.Count == Power.Items.Length && pairs.Contains(Power.SubVideo + "/" + Power.VideoConLock) && pairs.Contains(Power.SubButtons + "/" + Power.LidAction), "меняем крышку, сон, экран и экран блокировки — без повторов");
                 Ok(Power.TryParse(sg + ";1,1;0,1800;900,900;120,120", out pg, out pv) && pv[0][0] == 1 && pv[1][1] == 1800 && !pv[4][0].HasValue, "файл версии 1.0 (4 параметра) читается");
 
                 // 5. Настоящие настройки питания — на временной КОПИИ схемы (активная схема не меняется)
@@ -875,6 +949,28 @@ namespace HbAi.ClamDown
                 {
                     uint?[][] orig = Power.Read(copy);
                     Ok(Same(orig, before), "копия схемы совпадает с вашей");
+                    // разные значения для сети и батареи читаются раздельно
+                    uint?[][] probe = new uint?[Power.Items.Length][];
+                    for (int i = 0; i < probe.Length; i++) probe[i] = new uint?[2];
+                    probe[1] = new uint?[] { 600, 1200 };
+                    Power.Write(copy, probe, false);
+                    uint?[][] pr = Power.Read(copy);
+                    Ok(pr[1][0] == 600 && pr[1][1] == 1200, "сон: сеть 600 и батарея 1200 читаются раздельно");
+                    Power.Write(copy, orig, false);
+                    // Begin: хвост прошлого раза сначала возвращается, исходные настройки не теряются
+                    string realDir = Store.Dir;
+                    Store.Dir = Path.Combine(Path.GetTempPath(), "clamdown_selftest_store_" + Guid.NewGuid().ToString("N"));
+                    try
+                    {
+                        Policy.Begin(copy, false);
+                        Policy.Begin(copy, false); // второй раз подряд, как после сбоя
+                        Guid sg2; uint?[][] sv2;
+                        Ok(Power.TryParse(File.ReadAllText(Store.Saved), out sg2, out sv2) && Same(sv2, orig), "двойной запуск не затирает исходные настройки");
+                        Ok(Watchdog.RestoreFromFile(Store.Saved, false) && Same(Power.Read(copy), orig), "после двойного запуска всё возвращается");
+                        File.WriteAllText(Store.Saved, "битый файл");
+                        Ok(!Watchdog.RestoreFromFile(Store.Saved, false) && !File.Exists(Store.Saved), "битый файл сохранённых удаляется");
+                    }
+                    finally { try { Directory.Delete(Store.Dir, true); } catch { } Store.Dir = realDir; }
                     Ok(orig[0][0].HasValue && orig[0][1].HasValue, "действие крышки читается");
                     string savedPath = Path.Combine(Path.GetTempPath(), "clamdown_saved_" + Guid.NewGuid().ToString("N") + ".txt");
                     File.WriteAllText(savedPath, Power.Serialize(copy, orig));
