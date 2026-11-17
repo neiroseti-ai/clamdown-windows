@@ -219,7 +219,11 @@ namespace HbAi.ClamDown
             try { using (Mutex.OpenExisting(App.MutexName)) { } appRunning = true; }
             catch (WaitHandleCannotBeOpenedException) { appRunning = false; }
             catch (UnauthorizedAccessException) { appRunning = true; }
-            if (ShouldRestore(File.Exists(Store.Saved), ReadPulse(Store.Pulse), DateTime.UtcNow, appRunning))
+            DateTime? pulse = ReadPulse(Store.Pulse);
+            bool saved = File.Exists(Store.Saved);
+            if (saved && (!pulse.HasValue || DateTime.UtcNow - pulse.Value > TimeSpan.FromSeconds(60)))
+                Store.Note("Страховка: пульс " + (pulse.HasValue ? ((int)(DateTime.UtcNow - pulse.Value).TotalSeconds) + " с назад" : "не найден") + ", программа " + (appRunning ? "запущена" : "не запущена") + ".");
+            if (ShouldRestore(saved, pulse, DateTime.UtcNow, appRunning))
             {
                 try { if (RestoreFromFile(Store.Saved, true)) Store.Note("Страховка: программа молчала больше 90 с, настройки питания возвращены."); }
                 catch (Exception e) { Store.Note("Страховка: ошибка возврата: " + e.Message); return 1; }
@@ -229,6 +233,47 @@ namespace HbAi.ClamDown
 
         /// <summary>Задача раз в минуту. Через XML: у задач из /SC MINUTE по умолчанию «не запускать от батареи»,
         /// а страховка нужна именно на батарее.</summary>
+        /// <summary>Сторож-процесс: запускается самой программой и ждёт её завершения. Нужен потому, что задачу планировщика
+        /// антивирус может запускать в «песочнице» с отдельной копией папки (проверено 17.11.2026: задача видит пустую папку).</summary>
+        public const string GuardMutex = "Local\\HbAi.ClamDown.Windows.Guard";
+        public static int Guard(int parentPid)
+        {
+            bool created;
+            using (Mutex m = new Mutex(true, GuardMutex, out created))
+            {
+                if (!created) return 0;
+                try { using (Process p = Process.GetProcessById(parentPid)) p.WaitForExit(); } catch { }
+                // программа закрылась: если штатно — сохранённых настроек нет; если её убили — ждём тишины пульса и возвращаем
+                for (int i = 0; i < 24; i++)
+                {
+                    if (!File.Exists(Store.Saved)) return 0;
+                    bool appRunning;
+                    try { using (Mutex.OpenExisting(App.MutexName)) { } appRunning = true; }
+                    catch (WaitHandleCannotBeOpenedException) { appRunning = false; }
+                    catch (UnauthorizedAccessException) { appRunning = true; }
+                    if (appRunning) return 0; // программу запустили снова — дальше она сама
+                    if (ShouldRestore(true, ReadPulse(Store.Pulse), DateTime.UtcNow, false))
+                    {
+                        try { if (RestoreFromFile(Store.Saved, true)) Store.Note("Сторож: программа закрылась аварийно, настройки питания возвращены."); }
+                        catch (Exception e) { Store.Note("Сторож: ошибка возврата: " + e.Message); }
+                        return 0;
+                    }
+                    Thread.Sleep(15000);
+                }
+            }
+            return 0;
+        }
+        public static void StartGuard(string exe)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(exe, "--guard " + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture));
+                psi.UseShellExecute = false; psi.CreateNoWindow = true;
+                Process.Start(psi).Dispose();
+            }
+            catch (Exception e) { Store.Note("Сторож не запустился: " + e.Message); }
+        }
+
         public static void Install(string exe)
         {
             string esc = System.Security.SecurityElement.Escape(exe);
@@ -482,6 +527,7 @@ namespace HbAi.ClamDown
             // остались настройки от прошлого запуска (сбой) — вернуть
             try { if (Watchdog.RestoreFromFile(Store.Saved, true)) Store.Note("При запуске найдены несохранённые настройки, возвращены."); } catch (Exception e) { Store.Note("Возврат при запуске: " + e.Message); }
             try { Watchdog.Install(Application.ExecutablePath); } catch { }
+            Watchdog.StartGuard(Application.ExecutablePath);
             Pulse();
             Refresh2();
             Tick();
@@ -737,6 +783,8 @@ namespace HbAi.ClamDown
         public static int Main(string[] args)
         {
             if (args.Length > 0 && args[0] == "--watchdog") return Watchdog.Run();
+            int gp;
+            if (args.Length > 1 && args[0] == "--guard" && int.TryParse(args[1], out gp)) return Watchdog.Guard(gp);
             if (args.Length > 1 && args[0] == "--selftest") return SelfTest.Run(args[1]);
             if (args.Length > 1 && args[0] == "--shot") return Shot(args[1]);
             if (args.Length > 0 && args[0] == "--uninstall")
